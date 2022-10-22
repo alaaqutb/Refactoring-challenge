@@ -6,19 +6,34 @@ const Part = require("nugttah-backend/modules/parts");
 const DirectOrderPart = require("nugttah-backend/modules/direct.order.parts");
 
 async function getDirectOrderPartsGroups(orderCreatedAt) {
-  const dps = await DirectOrderPart.Model.find({
-    createdAt: { $gt: orderCreatedAt },
-    fulfillmentCompletedAt: { $exists: true },
-    invoiceId: { $exists: false },
-  }).select("_id directOrderId partClass priceBeforeDiscount");
-
-  const all_ps = await Part.Model.find({
-    directOrderId: { $exists: true },
-    createdAt: { $gt: orderCreatedAt },
-    partClass: "requestPart",
-    pricedAt: { $exists: true },
-    invoiceId: { $exists: false },
-  }).select("_id directOrderId partClass premiumPriceBeforeDiscount");
+  const [dps, all_ps] = await Promise.all([
+    DirectOrderPart.Model.find({
+      createdAt: {
+        $gt: orderCreatedAt,
+      },
+      fulfillmentCompletedAt: {
+        $exists: true,
+      },
+      invoiceId: {
+        $exists: false,
+      },
+    }).select("_id directOrderId partClass priceBeforeDiscount"),
+    Part.Model.find({
+      directOrderId: {
+        $exists: true,
+      },
+      createdAt: {
+        $gt: orderCreatedAt,
+      },
+      partClass: "requestPart",
+      pricedAt: {
+        $exists: true,
+      },
+      invoiceId: {
+        $exists: false,
+      },
+    }).select("_id directOrderId partClass premiumPriceBeforeDiscount"),
+  ]);
 
   const allParts = all_ps.concat(dps);
   const directOrderPartsGroups = Helpers.groupBy(allParts, "directOrderId");
@@ -58,7 +73,7 @@ function getRequestsOrdersPricesAndIds(allDirectOrderParts) {
   };
 }
 
-async function calculateWalletPaymentAmount(
+function calculateWalletPaymentAmount(
   walletPaymentAmount,
   totalAmount,
   invoces
@@ -69,16 +84,33 @@ async function calculateWalletPaymentAmount(
       walletPaymentAmount - invo.walletPaymentAmount
     );
   });
-  return Math.min(walletPaymentAmount, totalAmount);
+  walletPaymentAmount = Math.min(walletPaymentAmount, totalAmount);
+  return walletPaymentAmount;
 }
 
-async function calculateDiscountAmount(discountAmount, totalAmount, invoces) {
+function calculateDiscountAmount(discountAmount, totalAmount, invoces) {
   invoces.forEach((nvc) => {
     discountAmount = Math.min(0, discountAmount - nvc.discountAmount);
   });
-  return Math.min(discountAmount, totalAmount);
+  discountAmount = Math.min(discountAmount, totalAmount);
+  return discountAmount;
 }
 
+function calculteTotalAmount(TotalPrice, directOrder, invoces) {
+  const { deliveryFees } = directOrder;
+  let { walletPaymentAmount, discountAmount } = directOrder;
+  let totalAmount = TotalPrice;
+  if (deliveryFees && invoces.length === 0) {
+    totalAmount += deliveryFees;
+  }
+  totalAmount -= calculateWalletPaymentAmount(
+    walletPaymentAmount,
+    invoces,
+    totalAmount
+  );
+  totalAmount -= calculateDiscountAmount(discountAmount, invoces, totalAmount);
+  return totalAmount;
+}
 async function createInvoice() {
   try {
     const orderCreatedAt = new Date("2021-04-01");
@@ -87,39 +119,21 @@ async function createInvoice() {
     const invcs = [];
 
     for (const allDirectOrderParts of directOrderPartsGroups) {
-      const directOrder = await DirectOrder.Model.findOne({
-        _id: allDirectOrderParts[0].directOrderId,
-      }).select(
-        "partsIds requestPartsIds discountAmount deliveryFees walletPaymentAmount"
-      );
-      const invoces = await Invoice.Model.find({
-        directOrderId: allDirectOrderParts[0].directOrderId,
-      }).select("walletPaymentAmount discountAmount deliveryFees");
+      const [directOrder, invoces] = await Promise.all([
+        DirectOrder.Model.findOne({
+          _id: allDirectOrderParts[0].directOrderId,
+        }).select(
+          "partsIds requestPartsIds discountAmount deliveryFees walletPaymentAmount"
+        ),
+        Invoice.Model.find({
+          directOrderId: allDirectOrderParts[0].directOrderId,
+        }).select("walletPaymentAmount discountAmount deliveryFees"),
+      ]);
 
       const { dps_id, rps_id, dpsprice, rpsprice } =
         getRequestsOrdersPricesAndIds(allDirectOrderParts);
       const TotalPrice = Helpers.Numbers.toFixedNumber(rpsprice + dpsprice);
-      const { deliveryFees } = directOrder;
-      let { walletPaymentAmount, discountAmount } = directOrder;
-      let totalAmount = TotalPrice;
-      if (directOrder.deliveryFees && invoces.length === 0) {
-        totalAmount += directOrder.deliveryFees;
-      }
-
-      if (walletPaymentAmount) {
-        totalAmount -= calculateWalletPaymentAmount(
-          walletPaymentAmount,
-          totalAmount,
-          invoces
-        );
-      }
-      if (discountAmount) {
-        totalAmount -= calculateDiscountAmount(
-          discountAmount,
-          totalAmount,
-          invoces
-        );
-      }
+      const totalAmount = calculteTotalAmount(TotalPrice, directOrder, invoces);
       if (totalAmount < 0) {
         throw Error(
           `Could not create invoice for directOrder: ${directOrder._id} with totalAmount: ${totalAmount}. `
@@ -137,18 +151,38 @@ async function createInvoice() {
         discountAmount,
       });
 
-      await DirectOrder.Model.updateOne(
-        { _id: directOrder._id },
-        { $addToSet: { invoicesIds: invoice._id } }
-      );
-      await DirectOrderPart.Model.update(
-        { _id: { $in: dps_id } },
-        { invoiceId: invoice._id }
-      );
-      await Part.Model.update(
-        { _id: { $in: rps_id } },
-        { invoiceId: invoice._id }
-      );
+      await Promise.all([
+        DirectOrder.Model.updateOne(
+          {
+            _id: directOrder._id,
+          },
+          {
+            $addToSet: {
+              invoicesIds: invoice._id,
+            },
+          }
+        ),
+        DirectOrderPart.Model.updateMany(
+          {
+            _id: {
+              $in: dps_id,
+            },
+          },
+          {
+            invoiceId: invoice._id,
+          }
+        ),
+        Part.Model.updateMany(
+          {
+            _id: {
+              $in: rps_id,
+            },
+          },
+          {
+            invoiceId: invoice._id,
+          }
+        ),
+      ]);
 
       invcs.push(invoice._id);
     }
